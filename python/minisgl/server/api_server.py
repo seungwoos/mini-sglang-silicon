@@ -261,19 +261,19 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
+    sampling_params = SamplingParams(
+        ignore_eos=req.ignore_eos,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+    )
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
             uid=uid,
             text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
+            sampling_params=sampling_params,
         )
     )
 

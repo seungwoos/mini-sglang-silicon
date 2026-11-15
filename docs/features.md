@@ -40,6 +40,24 @@ Mini-SGLang integrates high-performance attention kernels, including [`FlashAtte
 
 You can specify the backend using the `--attn` argument. If two values are provided (e.g., `--attn fa,fi`), the first specifies the prefill backend and the second the decode backend. Note that some attention backend might override the user-provided page size (e.g. `trtllm` only supports page size 16,32,64).
 
+The PyTorch SDPA backend (`sdpa`) provides eager attention on CPU and MPS without FlashInfer or sgl-kernel. It reads the existing paged KV cache, supports GQA/MQA, and applies causal masking for cached prefixes and chunked prefill. It processes requests separately and gathers their KV tensors, so it is a correctness baseline rather than a fused paged-attention implementation. CUDA graphs are unsupported; select `--attn sdpa --cuda-graph-max-bs 0` to use it with the existing CUDA engine.
+
+On Apple Silicon, launch the API server with `--device mps`. This path uses SDPA and defaults to the `naive` KV cache. CPU and MPS support dense models with TP=1 and require an explicit KV cache size in pages. Greedy decoding uses `argmax` on the selected device. Temperature, top-k, and top-p sampling use PyTorch on the CPU, including when the model runs on MPS.
+
+```bash
+python -m minisgl --model Qwen/Qwen3-0.6B --device mps --dtype float32 --num-pages 256
+```
+
+Send a request after the server starts. Use `temperature: 0` for greedy decoding.
+
+```bash
+curl http://127.0.0.1:1919/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-0.6B","prompt":"The capital of France is","temperature":0.6,"top_k":20,"top_p":0.9,"max_tokens":8}'
+```
+
+For offline use, pass `device="mps"` and `num_page_override=256` to `LLM` or `EngineConfig`.
+
 ## CUDA Graph
 
 To minimize CPU launch overhead during decoding, Mini-SGLang supports capturing and replaying CUDA graphs. This feature is enabled by default. The maximum batch size for CUDA graph capture can be set with `--cuda-graph-max-bs n`. Setting `n` to `0` disables this feature.
