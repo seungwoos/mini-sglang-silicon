@@ -23,27 +23,47 @@ logger = init_logger(__name__)
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
-    copy_done_event: torch.cuda.Event
+    copy_done_event: torch.cuda.Event | None
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        _adjust_config(config)
+        device = torch.device(config.device)
+        is_cuda = device.type == "cuda"
+        if is_cuda:
+            assert not torch.cuda.is_initialized()
+            if device.index is None:
+                device = torch.device(f"cuda:{config.tp_info.rank}")
+        else:
+            if device.type == "mps" and not torch.backends.mps.is_available():
+                raise RuntimeError("MPS is not available on this PyTorch installation.")
+            if config.tp_info.size != 1 or config.model_config.is_moe:
+                raise NotImplementedError("Non-CUDA execution requires a dense model with TP=1.")
+            if config.attention_backend not in ("auto", "sdpa"):
+                raise ValueError("Non-CUDA execution requires the SDPA attention backend.")
+            if config.num_page_override is None or config.num_page_override <= 1:
+                raise ValueError("Non-CUDA execution requires num_page_override > 1.")
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
-        torch.cuda.set_device(self.device)
+        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        _adjust_config(config, is_cuda)
+
+        self.device = device
+        self.stream: torch.cuda.Stream | None = None
+        if is_cuda:
+            torch.cuda.set_device(self.device)
+            self.stream = torch.cuda.Stream()
+            torch.cuda.set_stream(self.stream)
+
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[1]
-        logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        self.tp_cpu_group = self._init_communication(config) if is_cuda else None
+        init_free_memory = None
+        if is_cuda:
+            init_free_memory = self._sync_get_memory()[1]
+            logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -82,6 +102,11 @@ class Engine:
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
+        self.graph_runner: GraphRunner | None = None
+        if self.stream is None:
+            return
+
+        assert init_free_memory is not None
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
@@ -145,8 +170,7 @@ class Engine:
         else:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        new_free_memory = self._sync_get_memory()[1]
+    def _determine_num_pages(self, old_free_memory: int | None, config: EngineConfig) -> int:
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
@@ -157,6 +181,8 @@ class Engine:
         )
         num_pages = config.num_page_override
         if num_pages is None:
+            assert old_free_memory is not None
+            new_free_memory = self._sync_get_memory()[1]
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             num_pages = available_memory // cache_per_page
@@ -189,9 +215,10 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
+        if self.stream is not None:
+            assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if self.graph_runner is not None and self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -200,27 +227,37 @@ class Engine:
             req.complete_one()
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        if self.stream is None:
+            return ForwardOutput(next_tokens_gpu, next_tokens_gpu.cpu(), None)
+
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
-        self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
-        destroy_distributed()
+        if self.graph_runner is not None:
+            self.graph_runner.destroy_cuda_graphs()
+        if self.tp_cpu_group is not None:
+            torch.distributed.destroy_process_group()
+            destroy_distributed()
 
 
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
 
 
-def _adjust_config(config: EngineConfig):
+def _adjust_config(config: EngineConfig, is_cuda: bool):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        if is_cuda:
+            backend = (
+                "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+            )
+        else:
+            backend = "sdpa"
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 

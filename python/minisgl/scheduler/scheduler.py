@@ -50,9 +50,13 @@ class Scheduler(SchedulerIOMixin):
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
-        torch.cuda.set_stream(self.stream)
+        if self.device.type == "cuda":
+            engine_stream = self.engine.stream
+            assert engine_stream is not None
+            self.engine_stream = engine_stream
+            self.stream = torch.cuda.Stream(device=self.device)
+            self.engine_stream_ctx = torch.cuda.stream(engine_stream)
+            torch.cuda.set_stream(self.stream)
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
@@ -99,7 +103,7 @@ class Scheduler(SchedulerIOMixin):
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
-                self.engine.stream.wait_stream(self.stream)
+                self.engine_stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(last_data)
@@ -119,9 +123,13 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        if self.device.type != "cuda":
+            while True:
+                self.normal_loop()
+
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
-                self.engine.stream.wait_stream(self.stream)
+                self.engine_stream.wait_stream(self.stream)
                 while True:
                     self.normal_loop()
         else:
@@ -131,7 +139,8 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -140,7 +149,10 @@ class Scheduler(SchedulerIOMixin):
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+
+        if copy_done is not None:
+            copy_done.synchronize()
+
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -202,7 +214,12 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
+        graph_runner = self.engine.graph_runner
+        if graph_runner is None:
+            batch.padded_reqs = batch.reqs
+        else:
+            graph_runner.pad_batch(batch)
+
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
@@ -235,7 +252,8 @@ class Scheduler(SchedulerIOMixin):
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    is_cuda = device.type == "cuda"
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=is_cuda)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -246,22 +264,25 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             out=indices_host[offset : offset + length],
         )
         offset += length
-    return indices_host.to(device, non_blocking=True)
+    # On MPS, finish copying before this temporary CPU buffer can be freed.
+    return indices_host.to(device, non_blocking=is_cuda)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    is_cuda = device.type == "cuda"
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=is_cuda)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    return mapping_host.to(device, non_blocking=is_cuda), batch.positions.to(torch.int64)
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    is_cuda = device.type == "cuda"
     mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=is_cuda)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=is_cuda)
+    return mapping_host.to(device, non_blocking=is_cuda), write_host.to(device, non_blocking=is_cuda)

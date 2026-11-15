@@ -21,9 +21,14 @@ def torch_dtype(dtype: torch.dtype):
 
 
 def nvtx_annotate(name: str, layer_id_field: str | None = None):
-    import torch.cuda.nvtx as nvtx
+    import torch
 
     def decorator(fn):
+        if not torch.backends.cuda.is_built():
+            return fn
+
+        import torch.cuda.nvtx as nvtx
+
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
             display_name = name

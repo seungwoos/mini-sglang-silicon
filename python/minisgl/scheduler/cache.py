@@ -131,8 +131,9 @@ def _write_page_table(
     page_size: int,
 ) -> None:
     needed_tokens = len(allocated)
-    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
-    positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+    is_cuda = page_table.is_cuda
+    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=is_cuda)
+    positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=is_cuda)
     offset = 0
     for table_idx, first_page, last_page in allocation_info:
         first_pos, last_pos = first_page * page_size, last_page * page_size
@@ -141,6 +142,6 @@ def _write_page_table(
         torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
         offset += length
     assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
-    table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
-    offsets = positions_host.to(page_table.device, non_blocking=True)
+    table_idxs = table_idx_host.to(page_table.device, non_blocking=is_cuda)
+    offsets = positions_host.to(page_table.device, non_blocking=is_cuda)
     page_table[table_idxs, offsets] = allocated

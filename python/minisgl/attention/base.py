@@ -24,14 +24,16 @@ class BaseAttnBackend(ABC):
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
 
-    @abstractmethod
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None: ...
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        raise NotImplementedError(
+            "This attention backend requires eager execution; set --cuda-graph-max-bs 0."
+        )
 
-    @abstractmethod
-    def prepare_for_capture(self, batch: Batch) -> None: ...
+    def prepare_for_capture(self, batch: Batch) -> None:
+        raise NotImplementedError("CUDA graph capture is not supported by this attention backend.")
 
-    @abstractmethod
-    def prepare_for_replay(self, batch: Batch) -> None: ...
+    def prepare_for_replay(self, batch: Batch) -> None:
+        raise NotImplementedError("CUDA graph replay is not supported by this attention backend.")
 
 
 class HybridBackend(BaseAttnBackend):

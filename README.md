@@ -142,6 +142,15 @@ You can also use `/reset` to clear the chat history.
 
 See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
 
+For a short Apple Silicon run using a local checkpoint:
+
+```bash
+uv run benchmark/offline/bench.py --model build/models/Qwen3-0.6B \
+    --device mps --num-pages 256 --num-seqs 2 --max-input-len 64 --max-output-len 16
+```
+
+The benchmark reports generated tokens per second, including prefill and sampling. Use `--temperature 0` to measure greedy decoding.
+
 Test Configuration:
 
 - Hardware: 1xH200 GPU.

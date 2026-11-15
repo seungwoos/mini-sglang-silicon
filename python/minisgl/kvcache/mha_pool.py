@@ -45,11 +45,19 @@ class MHAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
+        k_cache = self._k_buffer[layer_id].view(self._storage_shape)
+        v_cache = self._v_buffer[layer_id].view(self._storage_shape)
+        if self.device.type != "cuda":
+            indices = out_loc.long()
+            k_cache[indices] = k.view(-1, *self._storage_shape[1:])
+            v_cache[indices] = v.view(-1, *self._storage_shape[1:])
+            return
+
         from minisgl.kernel import store_cache
 
         store_cache(
-            k_cache=self._k_buffer[layer_id].view(self._storage_shape),
-            v_cache=self._v_buffer[layer_id].view(self._storage_shape),
+            k_cache=k_cache,
+            v_cache=v_cache,
             indices=out_loc,
             k=k,
             v=v,

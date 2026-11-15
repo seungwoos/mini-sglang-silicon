@@ -76,6 +76,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=ServerArgs.device,
+        help="Device for inference. CPU and MPS require --num-pages.",
+    )
+
+    parser.add_argument(
         "--dtype",
         type=str,
         default="auto",
@@ -205,9 +212,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--cache-type",
         type=str,
-        default=ServerArgs.cache_type,
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
-        help="The KV cache management strategy.",
+        help="The KV cache management strategy. Defaults to radix on CUDA and naive on CPU/MPS.",
     )
 
     parser.add_argument(
@@ -225,6 +231,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    device = kwargs["device"]
+    if device != "cuda":
+        if device == "mps" and not torch.backends.mps.is_available():
+            parser.error("MPS is not available in this PyTorch process.")
+        if kwargs["tensor_parallel_size"] != 1:
+            parser.error("CPU and MPS require --tp-size 1.")
+        if kwargs["num_page_override"] is None or kwargs["num_page_override"] <= 1:
+            parser.error("CPU and MPS require --num-pages greater than 1.")
+        if kwargs["attention_backend"] not in ("auto", "sdpa"):
+            parser.error("CPU and MPS require --attn auto or sdpa.")
+    if kwargs["cache_type"] is None:
+        kwargs["cache_type"] = ServerArgs.cache_type if device == "cuda" else "naive"
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
@@ -263,6 +281,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    if device != "cuda" and result.model_config.is_moe:
+        parser.error("CPU and MPS require a dense model.")
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
