@@ -32,23 +32,33 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
-
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
-        )
+        if query.is_cuda:
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+
+            apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+            )
+        else:
+            cos, sin = self._cos_sin_cache[positions.long()].unsqueeze(1).chunk(2, dim=-1)
+
+            for tensor in (query, key):
+                heads = tensor.unflatten(-1, (-1, self.head_size))
+                left, right = heads.chunk(2, dim=-1)
+
+                rotated = torch.cat((left * cos - right * sin, right * cos + left * sin), dim=-1)
+
+                heads.copy_(rotated)
+
         return query, key
 
 
@@ -97,7 +107,11 @@ def _get_rope(
             orig_max_pos: int = rope_scaling["original_max_position_embeddings"]
 
             def _find_correction_dim(num_rotations: float) -> float:
-                return rotary_dim * math.log(orig_max_pos / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+                return (
+                    rotary_dim
+                    * math.log(orig_max_pos / (num_rotations * 2 * math.pi))
+                    / (2 * math.log(base))
+                )
 
             low = max(math.floor(_find_correction_dim(beta_fast)), 0)
             high = min(math.ceil(_find_correction_dim(beta_slow)), rotary_dim // 2 - 1)
@@ -105,7 +119,8 @@ def _get_rope(
             def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
                 ramp = torch.clamp(
                     (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / max(high - low, 1),
-                    0, 1,
+                    0,
+                    1,
                 )
                 return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
 

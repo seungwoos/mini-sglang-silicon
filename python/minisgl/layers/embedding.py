@@ -31,6 +31,11 @@ class VocabParallelEmbedding(BaseOP):
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            if self.tp_size != 1:
+                raise NotImplementedError("Non-CUDA embedding requires tensor parallel size 1.")
+            return F.embedding(x, self.weight)
+
         from minisgl.kernel import indexing
 
         y = indexing(
